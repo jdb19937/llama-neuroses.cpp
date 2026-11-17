@@ -1259,6 +1259,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         cur = moe_out;
     }
 
+    // steering: the control vector goes into the FFN output, before build_hc_combine scatters it over the streams
+    cur = build_cvec(cur, il);
+
     return cur;
 }
 

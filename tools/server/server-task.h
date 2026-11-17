@@ -11,6 +11,7 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 #include "mtmd-helper.h"
+#include "server-steer.h"
 
 
 enum server_task_type {
@@ -95,6 +96,8 @@ struct task_params {
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
     std::map<int, float> lora; // mapping adapter ID -> scale
+
+    server_steer steer; // per-request activation steering (see server-steer.h)
 
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;

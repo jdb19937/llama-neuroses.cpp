@@ -238,6 +238,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.lora = parse_lora_request(lora);
         }));
 
+    add((new field_json("steer"))
+        ->set_desc("Activation steering for this request: a list of pushes, each with `layer`, `scale` and either `neuron` (plus `expert` for a routed MoE expert) or a raw `vector`. Omitted or empty means unsteered")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const int32_t from = ctx.params.steer.from;
+            ctx.params.steer = parse_steer_request(data.at("steer"));
+            ctx.params.steer.from = from;
+        }));
+
+    add((new field_num("steer_from", params.steer.from))
+        ->set_desc("Leave the first N prompt tokens unsteered (e.g. the system prompt and tool definitions); steering applies from token N on"));
+
     // sequence breakers for DRY
     // Currently, this is not compatible with TextGen WebUI, Koboldcpp and SillyTavern format
     // Ref: https://github.com/oobabooga/text-generation-webui/blob/d1af7a41ade7bd3c3a463bfa640725edb818ebaf/extensions/openai/typing.py#L39

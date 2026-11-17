@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include <atomic>
+#include <limits>
 #include <thread>
 #include "base64.hpp"
 #include "server-chat.h"
@@ -173,6 +174,7 @@ struct server_batch {
 
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
+    bool   steer_off         = false; // this batch holds tokens before the slot's steer_from: decode it unsteered
 
     void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
@@ -211,6 +213,7 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        steer_off         = false;
     }
 
     int32_t size() const {
@@ -389,6 +392,12 @@ struct server_slot {
 
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
+
+    // activation steering of the task this slot last ran (see server-steer.h)
+    std::string        steer_key;                // empty: unsteered
+    std::vector<float> steer_buf;                // the control vector for steer_key
+    int32_t            steer_from        = 0;    // tokens before this index are processed unsteered
+    int32_t            steer_cache_limit = -1;   // >= 0: only this many leading cached tokens are valid for the next prompt
 
     // sampling
     json json_schema;
@@ -1118,6 +1127,10 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // activation steering: steer_installed is the key of the vector now set in ctx_tgt (empty = none)
+    server_steer_source steer_source;
+    std::string         steer_installed;
 
     server_metrics metrics;
 
@@ -1879,6 +1892,36 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // per-request steering.  The vector itself is installed per batch in update_slots (tokens before steer_from
+        // are decoded without it); here the request is validated and the slot's cache is limited to what stays valid.
+        {
+            const auto & st = task.params.steer;
+            const std::string key = st.key.empty() ? "" : st.key + "@" + std::to_string(st.from);
+            if (key != slot.steer_key) {
+                std::vector<float> buf;
+                if (!st.pushes.empty()) {
+                    std::string err;
+                    if (!steer_source.build(st, params_base.model.path, llama_model_n_layer(model_tgt), llama_model_n_embd(model_tgt), buf, err)) {
+                        send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+                        return false;
+                    }
+                }
+                // cached tokens below both the old and the new steer_from were computed unsteered both times
+                const int32_t inf      = std::numeric_limits<int32_t>::max();
+                const int32_t old_from = slot.steer_key.empty() ? inf : slot.steer_from;
+                const int32_t new_from = key.empty()            ? inf : st.from;
+                const int32_t valid    = std::min(old_from, new_from);
+                slot.steer_cache_limit = slot.steer_cache_limit < 0 ? valid : std::min(slot.steer_cache_limit, valid);
+                slot.steer_key  = key;
+                slot.steer_buf  = std::move(buf);
+                slot.steer_from = key.empty() ? 0 : st.from;
+                if (prompt_cache) {
+                    prompt_cache->states.clear();     // saved states carry no steering tag
+                }
+                SLT_INF(slot, "steering changed: %zu pushes from token %d, cache valid up to %d\n", st.pushes.size(), slot.steer_from, valid == inf ? -1 : valid);
+            }
+        }
+
         // per-request lora if given, otherwise the global config
         auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
         if (!are_lora_equal(task_loras, slot.lora)) {
@@ -3568,6 +3611,18 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+
+            // steering: one vector for the whole context, swapped when the batch needs another (or none)
+            const std::string & want = batch.steer_off ? std::string() : slot_batched->steer_key;
+            if (want != steer_installed) {
+                const int32_t n_embd = llama_model_n_embd(model_tgt);
+                if (want.empty()) {
+                    llama_set_adapter_cvec(ctx_tgt, nullptr, 0, n_embd, -1, -1);
+                } else {
+                    llama_set_adapter_cvec(ctx_tgt, slot_batched->steer_buf.data(), slot_batched->steer_buf.size(), n_embd, 1, llama_model_n_layer(model_tgt) - 1);
+                }
+                steer_installed = want;
+            }
         }
 
         int32_t off_next = 0;
@@ -4058,6 +4113,11 @@ private:
                                     n_past = std::min(n_past, n_decision_first);
                                 }
 
+                                // cached tokens computed under another steering are not reusable
+                                if (slot.steer_cache_limit >= 0) {
+                                    n_past = std::min(n_past, slot.steer_cache_limit);
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -4244,6 +4304,7 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+                        slot.steer_cache_limit = -1;
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4305,6 +4366,12 @@ private:
                         alora_scale = slot.lora[enabled_loras[0]].scale;
                         slot.lora[enabled_loras[0]].scale = 0.0f;
                         alora_disabled_id = enabled_loras[0];
+                    }
+
+                    // steering starts at steer_from: uncached tokens before it go in a batch of their own, unsteered
+                    const bool pre_steer = !slot.steer_key.empty() && slot.prompt.n_tokens() < slot.steer_from;
+                    if (pre_steer) {
+                        batch.steer_off = true;
                     }
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
@@ -4394,6 +4461,10 @@ private:
 
                         // the outputs of a decision are read from one batch, do not split them
                         if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
+                            break;
+                        }
+
+                        if (pre_steer && slot.prompt.n_tokens() == slot.steer_from) {
                             break;
                         }
 
